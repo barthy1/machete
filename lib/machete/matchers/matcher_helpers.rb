@@ -23,8 +23,10 @@ module Machete
     end
 
     def dockerfile(env_vars, fixture_path, buildpack_path, network_command)
+      platform = RbConfig::CONFIG['host_cpu']
+      base_image = platform == 'powerpc64le' ? "ppc64le/cflinuxfs2" : "cloudfoundry/cflinuxfs2"
           <<-DOCKERFILE
-    FROM cloudfoundry/cflinuxfs2
+    FROM #{base_image}
 
     ENV CF_STACK cflinuxfs2
     ENV VCAP_APPLICATION {}

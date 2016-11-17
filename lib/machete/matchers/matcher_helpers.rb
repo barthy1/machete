@@ -24,7 +24,7 @@ module Machete
 
     def dockerfile(env_vars, fixture_path, buildpack_path, network_command)
           <<-DOCKERFILE
-    FROM cloudfoundry/cflinuxfs2
+    FROM barthy/cflinuxfs2
 
     ENV CF_STACK cflinuxfs2
     ENV VCAP_APPLICATION {}

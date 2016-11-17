@@ -51,7 +51,7 @@ EOF
       network_command = '(sudo tcpdump -n -i eth0 not udp port 53 and ip -t -Uw /tmp/dumplog &) && /buildpack/bin/detect /tmp/staged && /buildpack/bin/compile /tmp/staged /tmp/cache && /buildpack/bin/release /tmp/staged /tmp/cache && pkill tcpdump; tcpdump -nr /tmp/dumplog || true'
 
       docker_exitstatus, docker_output, dockerfile_path = execute_docker_file(app, :uncached, docker_image_name, docker_env_vars, network_command)
-
+      puts docker_output
       @traffic_lines = docker_output.split("\n").grep(/IP ([\d+\.]+) > ([\d+\.]+)\.(\d+)/)
     ensure
       unless `docker images | grep #{docker_image_name}`.strip.empty?

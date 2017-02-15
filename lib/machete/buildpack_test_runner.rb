@@ -5,7 +5,7 @@ require 'fileutils'
 
 module Machete
   class BuildpackTestRunner
-    attr_reader :stack, :mode, :host, :should_build, :should_upload, :rspec_options
+    attr_reader :stack, :mode, :host, :should_build, :should_upload, :rspec_options, :test_version, :integration_space, :delete_space_on_exit, :shared_host
 
     def initialize(args)
       @stack = 'cflinuxfs2'
@@ -13,7 +13,9 @@ module Machete
       @mode = 'cached'
       @should_build = true
       @should_upload = true
+      @shared_host = false
       @rspec_options = 'cf_spec'
+      @delete_space_on_exit = false
 
       set_values_from_args(process_args(args))
     end
@@ -30,7 +32,7 @@ module Machete
       indent "Running specs"
 
       rspec_command = <<-COMMAND
-BUNDLE_GEMFILE=cf.Gemfile BUILDPACK_MODE=#{@mode} CF_STACK=#{@stack} bundle exec rspec \
+BUNDLE_GEMFILE=cf.Gemfile BUILDPACK_MODE=#{@mode} CF_STACK=#{@stack} SHARED_HOST=#{@shared_host} BUILDPACK_VERSION=#{test_version} bundle exec rspec \
   --require rspec/instafail \
   --format RSpec::Instafail \
   --format documentation \
@@ -50,18 +52,28 @@ BUNDLE_GEMFILE=cf.Gemfile BUILDPACK_MODE=#{@mode} CF_STACK=#{@stack} bundle exec
         build_new_buildpack
       end
 
+      language = detect_language
+      unless @integration_space
+        @integration_space = "integration-#{language}-#{Time.now.to_i}"
+      end
+
       indent "Connecting to CF"
 
       script_dir = File.expand_path(File.join(__dir__, '..', '..', 'scripts'))
 
-      system "#{script_dir}/cf_login_and_setup #{@host}"
+      system "#{script_dir}/cf_login_and_setup #{@host} #{@integration_space}"
 
       if @should_upload
-        puts "Disabling all buildpacks"
-        disabled_buildpacks = disable_buildpacks
+        if @shared_host
+          upload_new_buildpack("#{language.gsub('-', '_')}_buildpack")
+          setup_signal_handling([])
+        else
+          puts "Disabling all buildpacks"
+          disabled_buildpacks = disable_buildpacks
 
-        setup_signal_handling_enable_buildpacks(disabled_buildpacks)
-        upload_new_buildpack
+          setup_signal_handling(disabled_buildpacks)
+          upload_new_buildpack
+        end
       end
     end
 
@@ -70,20 +82,27 @@ BUNDLE_GEMFILE=cf.Gemfile BUILDPACK_MODE=#{@mode} CF_STACK=#{@stack} bundle exec
 Usage: buildpack-build [options]
 
 Options:
-    [--stack=STACK]       # Specifies the stack that the test will run against.
-                          # Default: cflinuxfs2
-                          # Possible values: cflinuxfs2
-    [--host=HOST]         # Specifies the host to target for running tests.
-                          # Example: edge-1.buildpacks-ci.cf-app.com
-                          # Default: local.pcfdev.io
-    [--cached]            # Specifies the test run of a buildpack with vendored dependencies
-                          # Default: true
-    [--uncached]          # Specifies the test run of a buildpack without vendored dependencies
-                          # Default: false
-    [--no-build]          # Specifies whether to build the targeted buildpack.
-                          # Default: true
-    [--no-upload]         # Specifies whether to upload local buildpack to cf. Overrides '--no-build' flag to true.
-                          # Default: true
+    [--stack=STACK]               # Specifies the stack that the test will run against.
+                                  # Default: cflinuxfs2
+                                  # Possible values: cflinuxfs2
+    [--host=HOST]                 # Specifies the host to target for running tests.
+                                  # Example: edge-1.buildpacks-gcp.ci.cf-app.com
+                                  # Default: local.pcfdev.io
+    [--cached]                    # Specifies the test run of a buildpack with vendored dependencies
+                                  # Default: true
+    [--uncached]                  # Specifies the test run of a buildpack without vendored dependencies
+                                  # Default: false
+    [--no-build]                  # Specifies whether to build the targeted buildpack.
+                                  # Default: true
+    [--no-upload]                 # Specifies whether to upload local buildpack to cf. Overrides '--no-build' flag to true.
+                                  # Default: true
+    [--shared-host]               # Specifies whether to replace the standard buildpack when uploading to cf. (only works if upload and build)
+                                  # Default: false
+    [--integration-space=SPACE]   # Space to use for integration specs
+                                  # Default: generated from the name of the buildpack + a timestamp
+    [--delete-space-on-exit]      # Specifes whether to delete the integration space after specs have finished
+                                  # Default: false
+
 
 Builds, uploads, and runs tests against a specified BUILDPACK.
 Any other supplied arguments will be passed as rspec arguments!
@@ -124,10 +143,10 @@ USAGE
 
     def validate_stack_option
       if @stack != "cflinuxfs2"
-        arg_error = <<~ERROR
-          ERROR: Invalid argument passed in for --stack option.
-          The valid --stack options are [ 'cflinuxfs2' ]
-        ERROR
+        arg_error = <<-ERROR
+  ERROR: Invalid argument passed in for --stack option.
+  The valid --stack options are [ 'cflinuxfs2' ]
+ERROR
         raise ArgumentError.new(arg_error)
       end
     end
@@ -143,34 +162,47 @@ USAGE
     def build_new_buildpack
       indent "Building #{@mode} buildpack"
       FileUtils.rm_rf(buildpack_zip_files)
-      system("BUNDLE_GEMFILE=cf.Gemfile bundle exec buildpack-packager --#{@mode}")
+
+      current_version = File.read('VERSION').strip
+      @test_version = "#{current_version}-#{Time.now.to_i}"
+      File.write('VERSION', @test_version)
+      raise "Buildpack packaging failed!" unless system("BUNDLE_GEMFILE=cf.Gemfile bundle exec buildpack-packager --#{@mode}")
+      File.write('VERSION', current_version)
     end
 
-    def upload_new_buildpack
+    def upload_new_buildpack(buildpack_name = nil)
       language = detect_language
+      buildpack_name ||= "#{language}-test-buildpack"
 
       indent "Uploading buildpack to CF"
-      system "cf delete-buildpack #{language}-test-buildpack -f"
-      system "cf create-buildpack #{language}-test-buildpack #{buildpack_zip_files.first} 1 --enable"
+      system "cf delete-buildpack #{buildpack_name} -f"
+      system "cf create-buildpack #{buildpack_name} #{buildpack_zip_files.first} 1 --enable"
     end
 
     def detect_language
+      return @detected_language if @detected_language
       indent "Detecting language"
       buildpack_zip_file = buildpack_zip_files.first
-      detected_language = buildpack_zip_file.split('_').first
-      indent "Language detected: #{detected_language}"
-      detected_language
+      @detected_language = buildpack_zip_file.split('_').first
+      indent "Language detected: #{@detected_language}"
+      @detected_language
     end
 
-    def setup_signal_handling_enable_buildpacks(disabled_buildpacks)
+    def setup_signal_handling(disabled_buildpacks)
       %w(HUP INT QUIT ABRT TERM EXIT).each do |sig|
         Signal.trap(sig) do
+          puts sig.inspect
           enable_buildpacks(disabled_buildpacks)
-          if sig != 'EXIT'
-            exit 1
-          end
+          delete_integration_space
+          #if sig != 'EXIT'
+         #   exit 1
+         # end
         end
       end
+    end
+
+    def delete_integration_space
+      system "cf delete-space -f #{@integration_space}" if @delete_space_on_exit
     end
 
     private
@@ -186,6 +218,9 @@ USAGE
         @should_build = false
         @should_upload = false
       end
+      if options[:shared_host]
+        @shared_host = true
+      end
       if options[:host]
         @host = options[:host]
       end
@@ -195,6 +230,12 @@ USAGE
       end
       if options[:rspec]
         @rspec_options = options[:rspec].join(' ')
+      end
+      if options[:integration_space]
+        @integration_space = options[:integration_space]
+      end
+      if options[:delete_space_on_exit]
+        @delete_space_on_exit = true
       end
     end
 
@@ -223,6 +264,12 @@ USAGE
         when '--no-upload'
           options[:no_build] = true
           options[:no_upload] = true
+        when '--shared-host'
+          options[:shared_host] = true
+        when /\-\-integration\-space=(.*)/
+          options[:integration_space] = $1
+        when '--delete-space-on-exit'
+          options[:delete_space_on_exit] = true
         else
           rspec_options.push arg
         end
